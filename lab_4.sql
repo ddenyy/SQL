@@ -27,111 +27,162 @@ CALL GetWinterExamTeachers();
 
 select * from studyPlan;
 
------б)
+-----б) ИСПРАВИЛ.
 --Процедура, на входе получающая специальность, номер курса и семестра и формирующая список дисциплин, 
 --по которым в данном семестре у этой специальности и курса стоят экзамен или зачет
-CREATE OR REPLACE PROCEDURE GetDisciplinesForSemester(
+DROP FUNCTION IF EXISTS GetDisciplinesForSemester(INT, INT, INT);
+CREATE OR REPLACE FUNCTION GetDisciplinesForSemester(
     input_speciality_code INT,
     input_course INT,
     input_semester INT
 )
+RETURNS TABLE(discipline_name VARCHAR(100)) -- Указываем, что функция возвращает таблицу с колонкой discipline_name
 LANGUAGE plpgsql
 AS $$
-DECLARE
-    rec RECORD; -- Объявляем переменную для хранения строки результата
 BEGIN
-    RAISE NOTICE 'Дисциплины для специальности % на курсе % в семестре %:', 
-                 input_speciality_code, input_course, input_semester;
-
-    FOR rec IN
-        SELECT DISTINCT d.name AS discipline_name
-        FROM studyPlan sp
-        JOIN discipline d ON sp.discipline_code = d.code
-        WHERE sp.speciality_code = input_speciality_code
-          AND sp.course = input_course
-          AND sp.semester = input_semester
-          AND sp.typereporting = 1 or sp.typereporting = 2 -- Условие: экзамен или зачет
-    LOOP
-        RAISE NOTICE '%', rec.discipline_name;
-    END LOOP;
+    RETURN QUERY
+    SELECT DISTINCT d.name AS discipline_name
+    FROM studyPlan sp
+    JOIN discipline d ON sp.discipline_code = d.code
+    WHERE sp.speciality_code = input_speciality_code
+      AND sp.course = input_course
+      AND sp.semester = input_semester
+      AND (sp.typereporting = 1 OR sp.typereporting = 2); -- Условие: экзамен или зачет
 END;
 $$;
 
-CALL GetDisciplinesForSemester(101, 1, 3);
+-- примеры запросов.
+SELECT * FROM GetDisciplinesForSemester(2, 2,2);
+SELECT * FROM GetDisciplinesForSemester(1, 1,1);
+SELECT * FROM GetDisciplinesForSemester(2, 1,1);
 
 
+-- ИСПРАВИЛ
 --с)Процедура, на входе получающая ФИО преподавателя, выходной параметр – количество часов нагрузки за оба семестра
+DROP PROCEDURE IF EXISTS GetTeacherWorkload(VARCHAR);
 CREATE OR REPLACE PROCEDURE GetTeacherWorkload(
-    input_teacher_fio VARCHAR(100) -- Входной параметр: ФИО преподавателя
+    input_teacher_fio VARCHAR(100), -- Входной параметр: ФИО преподавателя
+    OUT total_hours INT             -- Выходной параметр: Общее число часов нагрузки
 )
 LANGUAGE plpgsql
 AS $$
-DECLARE
-    total_hours INT; -- Локальная переменная для хранения результата
 BEGIN
-    -- Подсчёт общего количества часов нагрузки
+    -- Инициализируем выходной параметр
+    total_hours := 0;
+
+    -- Проверяем, существует ли преподаватель
+    IF NOT EXISTS (
+        SELECT 1 FROM teacher t WHERE t.FIO = input_teacher_fio
+    ) THEN
+        total_hours := -1; -- Преподаватель не найден
+        RETURN;
+    END IF;
+
+    -- Подсчитываем общее количество часов нагрузки с использованием LEFT JOIN
     SELECT COALESCE(SUM(sp.timeLecture + sp.timePractice), 0)
     INTO total_hours
     FROM teacher t
-    JOIN Lead l ON t.ID = l.teacher_ID
-    JOIN studyPlan sp ON l.studyPlan_contractNumber = sp.contractNumber
+    LEFT JOIN Lead l ON t.ID = l.teacher_ID
+    LEFT JOIN studyPlan sp ON l.studyPlan_contractNumber = sp.contractNumber
     WHERE t.FIO = input_teacher_fio;
 
-    -- Выводим результат
-    IF total_hours = 0 THEN
-        RAISE NOTICE 'Преподаватель % не имеет нагрузки.', input_teacher_fio;
-    ELSE
-        RAISE NOTICE 'Преподаватель % имеет нагрузку: % часов.', input_teacher_fio, total_hours;
-    END IF;
+    -- Если нагрузки нет, total_hours уже равен 0
+    -- Если нагрузка есть, total_hours будет > 0
 END;
 $$;
-CALL GetTeacherWorkload('Иванов Иван Иванович');
+
+-- Пример с преподавателем без нагрузки
+DO $$
+DECLARE
+    total_hours INT;
+BEGIN
+    CALL GetTeacherWorkload('Сидоров Сергей Сергеевич', total_hours);
+    RAISE NOTICE 'Результат для Сидорова: %', total_hours;
+	
+	CALL GetTeacherWorkload('Иванов Иван Иванович', total_hours);
+    RAISE NOTICE 'Результат для Иванов Иван Иванович: %', total_hours;
+	
+	CALL GetTeacherWorkload('Кузнецова Елена Павловна', total_hours);
+    RAISE NOTICE 'Результат для Кузнецова Елена Павловна: %', total_hours;
+
+	CALL GetTeacherWorkload('Новикова Ольга Александровна', total_hours);
+    RAISE NOTICE 'Результат для Новикова Ольга Александровна: %', total_hours;
+
+	CALL GetTeacherWorkload('Иванов Иван Иванович2123', total_hours);
+    RAISE NOTICE 'Результат для Иванов Иван Иванович2123: %', total_hours;
+
+END;
+$$;
+
 
 ---------
 -- d)Процедура, вызывающая вложенную процедуру, которая подсчитывает среднее количество часов в год по дисциплинам,
 --   и выдающая список дисциплин с количеством часов в год меньше среднего
-CREATE OR REPLACE PROCEDURE GetDisciplinesBelowAverage()
-LANGUAGE plpgsql
-AS $$
-DECLARE
-    avg_hours_per_year NUMERIC; -- Переменная для хранения среднего количества часов
-	rec RECORD; -- Переменная для хранения строки в цикле
-BEGIN
-    -- Вызов вложенной процедуры для вычисления среднего количества часов
-    CALL CalculateAverageHoursPerYear(avg_hours_per_year);
 
-    RAISE NOTICE 'Среднее количество часов в год по всем дисциплинам: %', avg_hours_per_year;
+--вычисление среднего количества часов по специальности
+DROP FUNCTION IF EXISTS CalculateAverageHoursPerSpeciality();
+DROP FUNCTION IF EXISTS GetDisciplinesBelowAverage();
 
-    -- Список дисциплин с количеством часов в год меньше среднего
-    FOR rec IN
-        SELECT d.name AS discipline_name, (sp.timeLecture + sp.timePractice) * 2 AS total_hours
-        FROM discipline d
-        JOIN studyPlan sp ON d.code = sp.discipline_code
-        GROUP BY d.name, sp.timeLecture, sp.timePractice
-        HAVING (SUM(sp.timeLecture + sp.timePractice) * 2) < avg_hours_per_year
-    LOOP
-        RAISE NOTICE 'Дисциплина: %, Часы в год: %', rec.discipline_name, rec.total_hours;
-    END LOOP;
-END;
-$$;
-
-CREATE OR REPLACE PROCEDURE CalculateAverageHoursPerYear(
-    OUT avg_hours NUMERIC -- Выходной параметр для среднего количества часов
+CREATE OR REPLACE FUNCTION CalculateAverageHoursPerSpeciality()
+RETURNS TABLE (
+    speciality_code INT,
+    average_hours INT
 )
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    -- Вычисление среднего количества часов в год по всем дисциплинам
-    SELECT COALESCE(AVG((sp.timeLecture + sp.timePractice) * 2), 0)
-    INTO avg_hours
-    FROM studyPlan sp;
+    RETURN QUERY
+    SELECT
+        total_hours_per_discipline.speciality_code, -- Используем speciality_code из CTE
+        AVG(total_hours_per_discipline.total_hours)::INT AS average_hours -- Приведение результата к INTEGER
+    FROM (
+        SELECT
+            sp.speciality_code,
+            sp.discipline_code,
+            SUM(sp.timeLecture + sp.timePractice) AS total_hours -- считаем общее количество часов для каждой дисциплины.	
+        FROM studyPlan sp
+        GROUP BY sp.speciality_code, sp.discipline_code
+    ) total_hours_per_discipline
+    GROUP BY total_hours_per_discipline.speciality_code; -- Корректное указание источника данных
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION GetDisciplinesBelowAverage()
+RETURNS TABLE (
+    speciality_name VARCHAR,
+    discipline_name VARCHAR,
+    total_hours INT,
+    average_hours INT
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RETURN QUERY
+    WITH average_hours_per_speciality AS (
+        SELECT * FROM CalculateAverageHoursPerSpeciality()
+    ),
+    total_hours_per_discipline AS (
+        SELECT
+            sp.speciality_code,
+            sp.discipline_code,
+            SUM(sp.timeLecture + sp.timePractice)::INT AS total_hours -- Приведение результата SUM к INTEGER
+        FROM studyPlan sp
+        GROUP BY sp.speciality_code, sp.discipline_code
+    )
+    SELECT
+        s.name AS speciality_name,
+        d.name AS discipline_name,
+        th.total_hours,
+        ah.average_hours
+    FROM total_hours_per_discipline th
+    JOIN average_hours_per_speciality ah ON th.speciality_code = ah.speciality_code
+    JOIN discipline d ON th.discipline_code = d.code
+    JOIN speciality s ON th.speciality_code = s.code
+    WHERE th.total_hours < ah.average_hours;
+END;
+$$;
 
-CALL GetDisciplinesBelowAverage();
-
-
+SELECT * FROM GetDisciplinesBelowAverage();
 
 
 -- пользовательские ф-ции
@@ -145,6 +196,16 @@ RETURNS INT AS $$
 DECLARE
     discipline_count INT;
 BEGIN
+    -- Проверяем, существует ли преподаватель в базе
+    IF NOT EXISTS (
+        SELECT 1
+        FROM teacher t
+        WHERE t.fio = teacher_fio
+    ) THEN
+        RETURN -1; -- Преподаватель не найден, возвращаем -1
+    END IF;
+
+    -- Подсчитываем количество уникальных дисциплин
     SELECT 
         COUNT(DISTINCT d.name) -- Подсчет уникальных наименований дисциплин
     INTO 
@@ -258,7 +319,7 @@ BEGIN
         s.name = speciality_name -- Указанная специальность
         AND sp.course = course_number -- Указанный курс
         AND sp.semester % 2 = 1 -- Зимний семестр (нечетные)
-        AND sp.typereporting = 1 -- Только экзамены
+        AND (sp.typereporting = 1) -- Только экзамены
     GROUP BY 
         d.name
     ORDER BY 
@@ -268,8 +329,8 @@ $$ LANGUAGE plpgsql;
 
 -- Пример вызова функции:
 SELECT * FROM get_exam_results_winter('Информатика', 1);
-
-
+SELECT * FROM get_exam_results_winter('Физика', 3);
+SELECT * FROM get_exam_results_winter('Экономика', 1);
 
 
 
