@@ -1,0 +1,285 @@
+--Триггер любого типа на добавление очередной оценки в список с оценками студента – проверяем соответствие оценки виду отчетности 
+--по данной дисциплине в соответствии с учебным планом (если тип отчетности – зачет, то оценка д.б. «зачет/незачет», 
+--если тип – экзамен, то оценка от «2» до «5»), в случае несоответствия строку с оценкой в список не добавляем.
+
+--хорошие принять, плохие отбросить. то есть не хочу чтобы выбрасывалось исключение.
+-- можно попробовать через последующий триггер. ИСКЛЮЧЕНИЕ НЕ БРОСАТЬ.
+CREATE OR REPLACE FUNCTION validate_mark()
+RETURNS TRIGGER AS $$
+DECLARE
+    expected_type INT; -- Тип отчётности (1 - экзамен, 2 - зачет)
+BEGIN
+    -- Получаем тип отчётности из таблицы studyPlan
+    SELECT sp.typeReporting
+    INTO expected_type
+    FROM studyPlan sp
+    WHERE sp.contractNumber = NEW.studyPlan_contractNumber
+    LIMIT 1;
+
+    -- Проверяем соответствие типа отчётности и оценки
+    IF expected_type = 2 THEN
+        -- Тип отчётности - зачет. Оценка должна быть "зачет" или "незачет".
+        IF NEW.mark NOT IN ('зачет', 'незачет') THEN
+            -- Выводим сообщение об отклонении
+            RAISE NOTICE 'Строка отклонена: student_ID = %, studyPlan_contractNumber = %, mark = % (Ожидаемая оценка: "зачет" или "незачет")',
+                NEW.student_ID, NEW.studyPlan_contractNumber, NEW.mark;
+            -- Отклоняем вставку
+            RETURN NULL;
+        ELSE
+            -- Выводим сообщение о принятии строки
+            RAISE NOTICE 'Строка принята: student_ID = %, studyPlan_contractNumber = %, mark = %', 
+                NEW.student_ID, NEW.studyPlan_contractNumber, NEW.mark;
+        END IF;
+    ELSIF expected_type = 1 THEN
+        -- Тип отчётности - экзамен. Оценка должна быть от "2" до "5".
+        IF NEW.mark NOT IN ('2', '3', '4', '5') THEN
+            -- Выводим сообщение об отклонении
+            RAISE NOTICE 'Строка отклонена: student_ID = %, studyPlan_contractNumber = %, mark = % (Ожидаемая оценка: "2", "3", "4" или "5")',
+                NEW.student_ID, NEW.studyPlan_contractNumber, NEW.mark;
+            -- Отклоняем вставку
+            RETURN NULL;
+        ELSE
+            -- Выводим сообщение о принятии строки
+            RAISE NOTICE 'Строка принята: student_ID = %, studyPlan_contractNumber = %, mark = %', 
+                NEW.student_ID, NEW.studyPlan_contractNumber, NEW.mark;
+        END IF;
+    ELSE
+        -- Неизвестный тип отчетности
+        RAISE NOTICE 'Строка отклонена: student_ID = %, studyPlan_contractNumber = %, mark = % (Неизвестный тип отчетности)', 
+            NEW.student_ID, NEW.studyPlan_contractNumber, NEW.mark;
+        -- Отклоняем вставку
+        RETURN NULL;
+    END IF;
+
+    -- Если проверка пройдена, строка добавляется
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER check_mark_before_insert
+BEFORE INSERT ON student_has_studyPlan
+FOR EACH ROW
+EXECUTE FUNCTION validate_mark();
+
+
+INSERT INTO student_has_studyPlan (student_ID, studyPlan_contractNumber, mark)
+VALUES (1, 1061, 'зачет'), (2, 1065, '5'), (2, 1004, 'не зачет'), (2, 1004, '5');
+
+-- пример НЕ успешной вставки для экзамена
+INSERT INTO student_has_studyPlan (student_ID, studyPlan_contractNumber, mark)
+VALUES (1, 1061, 'зачет'), (3, 1061, '5'), (2, 1002, '5')
+
+-- пример успешной вставки.
+INSERT INTO student_has_studyPlan (student_ID, studyPlan_contractNumber, mark)
+VALUES (2, 1061, '5');
+-- пример НЕ успешной вставки для зачета.
+INSERT INTO student_has_studyPlan (student_ID, studyPlan_contractNumber, mark)
+VALUES (2, 1004, 'зачет');
+
+select * from studyPlan where studyPlan.contractnumber = 1004
+
+INSERT INTO student_has_studyPlan (student_ID, studyPlan_contractNumber, mark)
+VALUES (3, 1001, '2');
+
+-- проверка что строка существует.
+SELECT * 
+FROM student_has_studyPlan
+WHERE student_ID = 2
+  AND studyPlan_contractNumber = 102
+  AND mark = '5';
+
+-- удаление успешной строки из бд
+DELETE FROM student_has_studyPlan
+WHERE student_ID = 2
+  AND studyPlan_contractNumber = 1002
+  AND mark = '5';
+
+-- удалить триггер на всякий.
+DROP TRIGGER IF EXISTS check_mark_before_insert ON student_has_studyPlan;
+
+
+
+
+-- Б) Последующий триггер на изменение студенту номера курса – если за зимнюю или летнюю сессию есть хотя бы один незачет,
+--«2» или неявка – номер курса остается прежним
+
+-- перевод вниз запретить. посмотреть с какого
+-- мы должны првоерять информацию о том курсе на котором он сейчас находится, все ли он сдал.
+-- если он тот курс на котором он сейчас находится закрыл, то можем его перевести.
+
+--нельзя вниз и нельзя несколько шагов вверх. И ПРОВЕРИТЬ перевести всех студентов одной группы с курса на курс. (прибавить 1 ко всем студентам которые учатся в какой-то группе)
+DROP TRIGGER IF EXISTS check_course_change ON student;
+
+CREATE OR REPLACE FUNCTION validate_course_change()
+RETURNS TRIGGER AS $$
+DECLARE
+    invalid_marks_count INT; -- Переменная для подсчёта некорректных оценок
+BEGIN
+    -- Проверка: нельзя переводить на курс ниже текущего
+    IF NEW.course < OLD.course THEN
+        RAISE NOTICE 'Перевод на курс ниже невозможен.';
+		RETURN NULL; 
+    END IF;
+
+    -- Проверка: нельзя переводить более чем на 1 курс сразу
+    IF ABS(NEW.course - OLD.course) > 1 THEN
+        RAISE NOTICE 'Перевод более чем на 1 курс сразу невозможен.';
+		RETURN NULL; 
+    END IF;
+
+    -- Подсчёт некорректных оценок за зимнюю или летнюю сессию
+    SELECT COUNT(*)
+    INTO invalid_marks_count
+    FROM student_has_studyPlan shsp
+    INNER JOIN studyPlan sp ON shsp.studyPlan_contractNumber = sp.contractNumber
+    WHERE shsp.student_ID = NEW.ID
+      AND (shsp.mark IN ('незачет', '2') -- Проверка незачета или двойки
+           OR shsp.mark IS NULL);        -- Проверка на неявку (NULL оценка)
+
+    -- Если есть хотя бы одна некорректная оценка, запрещаем изменение курса
+    IF invalid_marks_count > 0 THEN
+		RAISE NOTICE 'Строка отклонена: student_ID = %, Курс не может быть изменён. Есть незачет, 2 или неявка.', NEW.id;
+		RETURN NULL;
+    END IF;
+	RAISE NOTICE 'Строка принята: student_ID = %', NEW.id;
+    RETURN NEW; -- Разрешаем обновление, если проверка пройдена
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER check_course_change
+BEFORE UPDATE OF course ON student
+FOR EACH ROW
+EXECUTE FUNCTION validate_course_change();
+
+-- начала транзакции
+BEGIN;
+
+-- Попытка обновления, не успешное из-за триггера
+UPDATE student
+SET course = 3
+WHERE ID = 3;
+
+-- Успешное обновление
+UPDATE student
+SET course = 100
+WHERE ID = 1;
+
+UPDATE student
+SET course = 1
+WHERE ID = 1;
+
+UPDATE student
+SET course = 10
+WHERE ID = 1;
+-- завершение, фиксируем изменения.
+COMMIT;
+
+
+select * from student where student.id = 1
+
+-- проверить что должен сдать студент или мб что он уже сдал.
+-- select * from public.student_has_studyplan where student_id = 3
+-- select * from studyPlan
+-- insert into public.student_has_studyplan values (3, 1009, 'незачет', 'зачет')
+-- -- код чтоб сделать студента отличником.
+-- UPDATE student_has_studyplan
+-- SET typeofmark = 'Экзамен'
+-- WHERE student_id = 3 and studyplan_contractnumber = 1001;
+
+--c) Замещающий триггер на операцию удаления строки из учебного плана – если есть результаты сдачи экзамена/зачета, соответствующие этой строке учебного плана – она не удаляется, 
+--выводится соотв. сообщение.
+
+
+CREATE OR REPLACE FUNCTION prevent_bulk_studyPlan_deletion()
+RETURNS TRIGGER AS $$
+DECLARE
+    rec RECORD; -- Переменная для хранения строки из таблицы OLD
+BEGIN
+    -- Перебираем все удаляемые строки из переходной таблицы OLD TABLE
+    FOR rec IN SELECT * FROM OLD_TABLE LOOP
+        -- Проверяем, есть ли связанные результаты сдачи экзаменов/зачетов
+        IF EXISTS (
+            SELECT 1
+            FROM student_has_studyPlan
+            WHERE studyPlan_contractNumber = rec.contractNumber
+        ) THEN
+            -- Если есть связанные записи, выбрасываем исключение
+            RAISE NOTICE 'Удаление запрещено. Есть связанные результаты сдачи экзаменов/зачетов для учебного плана %.', rec.contractNumber;
+			RETURN NULL;
+        END IF;
+    END LOOP;
+
+    -- Если все проверки пройдены, удаление разрешается
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER prevent_bulk_studyPlan_deletion_trigger
+AFTER DELETE ON studyPlan
+REFERENCING OLD TABLE AS OLD_TABLE
+FOR EACH STATEMENT
+EXECUTE FUNCTION prevent_bulk_studyPlan_deletion();
+
+
+select * from public.studyplan
+DELETE FROM public.studyplan WHERE contractnumber = 1001;
+DROP TRIGGER IF EXISTS prevent_bulk_studyPlan_deletion_trigger ON studyPlan;
+
+
+
+
+
+--v2 for view
+CREATE VIEW studyPlan_view AS
+SELECT contractNumber, course, semester
+FROM studyPlan;
+
+
+-- замещающий выполняется вместо. зачем бросать исключение если оно и так не выполнилось.
+-- те которые мы не принимаем не надо вызывать exeption.
+-- проверить на множественное удаление. причем проверять так чтоб были и хорошие и плохие.
+CREATE OR REPLACE FUNCTION prevent_studyPlan_deletion()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Проверяем наличие связанных записей в student_has_studyPlan
+    IF EXISTS (
+        SELECT 1
+        FROM student_has_studyPlan
+        WHERE studyPlan_contractNumber = OLD.contractNumber
+    ) THEN
+        RAISE NOTICE 'Удаление запрещено. Есть связанные записи в student_has_studyPlan для учебного плана с контрактным номером %.', OLD.contractNumber;
+        RETURN NULL; -- Прерываем удаление для текущей строки
+    END IF;
+
+    -- Проверяем наличие связанных записей в lead
+    IF EXISTS (
+        SELECT 1
+        FROM lead
+        WHERE studyPlan_contractNumber = OLD.contractNumber
+    ) THEN
+        RAISE NOTICE 'Удаление запрещено. Есть связанные записи в lead для учебного плана с контрактным номером %.', OLD.contractNumber;
+        RETURN NULL; -- Прерываем удаление для текущей строки
+    END IF;
+	RAISE NOTICE 'Удаление разрешено contractNumber %.', OLD.contractNumber;
+    -- Если проверки пройдены, удаляем запись из studyPlan
+    DELETE FROM studyPlan WHERE contractNumber = OLD.contractNumber;
+
+    RETURN OLD; -- Завершаем обработку текущей строки
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER prevent_studyPlan_deletion_trigger
+INSTEAD OF DELETE ON studyPlan_view
+FOR EACH ROW
+EXECUTE FUNCTION prevent_studyPlan_deletion();
+
+DROP TRIGGER IF EXISTS prevent_studyPlan_deletion_trigger ON studyPlan_view;
+
+DELETE FROM studyPlan_view
+WHERE contractNumber in(1002, 1001, 1003,1004, 1005, 1111);
+
+
+select * from studyPlan_view;
+
+insert into studyPlan_view values (1111, 1, 1)
+
